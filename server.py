@@ -12,6 +12,7 @@ import httpx
 from datetime import datetime, timedelta
 import json
 import os
+import asyncio
 from pathlib import Path
 
 
@@ -233,6 +234,263 @@ async def get_virtual_servers(
 
 
 # ============================================================================
+# AS3 MANAGEMENT HELPERS
+# ============================================================================
+
+async def get_latest_as3_release() -> Dict:
+    """
+    Fetch the latest AS3 release information from GitHub API.
+
+    Returns:
+        Dictionary with: version, rpm_url, rpm_filename, sha256
+
+    Raises:
+        Exception: If GitHub API request fails
+    """
+    github_api_url = "https://api.github.com/repos/F5Networks/f5-appsvcs-extension/releases/latest"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(github_api_url, timeout=30.0)
+            response.raise_for_status()
+
+            data = response.json()
+            version = data.get("tag_name", "").replace("v", "")  # Remove 'v' prefix
+
+            # Find the RPM asset
+            rpm_asset = None
+            sha256_asset = None
+
+            for asset in data.get("assets", []):
+                name = asset.get("name", "")
+                if name.endswith(".rpm") and "f5-appsvcs" in name:
+                    rpm_asset = asset
+                elif name.endswith(".rpm.sha256"):
+                    sha256_asset = asset
+
+            if not rpm_asset:
+                raise Exception("Could not find AS3 RPM in latest GitHub release")
+
+            return {
+                "version": version,
+                "rpm_url": rpm_asset.get("browser_download_url"),
+                "rpm_filename": rpm_asset.get("name"),
+                "sha256_url": sha256_asset.get("browser_download_url") if sha256_asset else None
+            }
+
+        except httpx.HTTPStatusError as e:
+            raise Exception(f"GitHub API request failed: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            raise Exception(f"Failed to fetch latest AS3 release: {str(e)}")
+
+
+async def check_as3_installed(
+    ip_address: str,
+    token: str,
+    verify_ssl: bool = False
+) -> Optional[str]:
+    """
+    Check if AS3 is installed on BIG-IP and return the version.
+
+    Args:
+        ip_address: BIG-IP management IP
+        token: Authentication token
+        verify_ssl: Whether to verify SSL certificates
+
+    Returns:
+        Version string if installed, None if not installed
+
+    Raises:
+        Exception: If API call fails (other than 404)
+    """
+    url = f"https://{ip_address}/mgmt/shared/appsvcs/info"
+
+    headers = {
+        "X-F5-Auth-Token": token,
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient(verify=verify_ssl) as client:
+        try:
+            response = await client.get(url, headers=headers, timeout=30.0)
+
+            if response.status_code == 404:
+                return None  # AS3 not installed
+
+            response.raise_for_status()
+            data = response.json()
+
+            # AS3 returns version in the response
+            return data.get("version", "unknown")
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise Exception(f"Failed to check AS3 status: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            raise Exception(f"Error checking AS3 installation: {str(e)}")
+
+
+async def download_as3_rpm(rpm_url: str, rpm_filename: str) -> bytes:
+    """
+    Download AS3 RPM from GitHub.
+
+    Args:
+        rpm_url: Download URL for the RPM
+        rpm_filename: Filename for logging purposes
+
+    Returns:
+        RPM file content as bytes
+
+    Raises:
+        Exception: If download fails
+    """
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            response = await client.get(rpm_url, timeout=300.0)  # 5 minute timeout for large file
+            response.raise_for_status()
+
+            return response.content
+
+        except httpx.HTTPStatusError as e:
+            raise Exception(f"Failed to download AS3 RPM: {e.response.status_code}")
+        except Exception as e:
+            raise Exception(f"Error downloading AS3 RPM from GitHub: {str(e)}")
+
+
+async def upload_as3_rpm(
+    ip_address: str,
+    token: str,
+    rpm_filename: str,
+    rpm_content: bytes,
+    verify_ssl: bool = False
+) -> bool:
+    """
+    Upload AS3 RPM to BIG-IP.
+
+    Args:
+        ip_address: BIG-IP management IP
+        token: Authentication token
+        rpm_filename: Name of the RPM file
+        rpm_content: RPM file content as bytes
+        verify_ssl: Whether to verify SSL certificates
+
+    Returns:
+        True if upload successful
+
+    Raises:
+        Exception: If upload fails
+    """
+    url = f"https://{ip_address}/mgmt/shared/file-transfer/uploads/{rpm_filename}"
+
+    headers = {
+        "X-F5-Auth-Token": token,
+        "Content-Type": "application/octet-stream",
+        "Content-Range": f"0-{len(rpm_content)-1}/{len(rpm_content)}"
+    }
+
+    async with httpx.AsyncClient(verify=verify_ssl) as client:
+        try:
+            response = await client.post(
+                url,
+                content=rpm_content,
+                headers=headers,
+                timeout=300.0  # 5 minute timeout for large file upload
+            )
+            response.raise_for_status()
+
+            return True
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                raise Exception("Authentication failed. AS3 installation requires admin account privileges.")
+            elif e.response.status_code == 403:
+                raise Exception("Permission denied. AS3 installation requires admin account (not just administrator role).")
+            raise Exception(f"Failed to upload AS3 RPM: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            raise Exception(f"Error uploading AS3 RPM to BIG-IP: {str(e)}")
+
+
+async def install_as3_package(
+    ip_address: str,
+    token: str,
+    rpm_filename: str,
+    verify_ssl: bool = False
+) -> str:
+    """
+    Install AS3 package on BIG-IP and wait for completion.
+
+    Args:
+        ip_address: BIG-IP management IP
+        token: Authentication token
+        rpm_filename: Name of the uploaded RPM file
+        verify_ssl: Whether to verify SSL certificates
+
+    Returns:
+        Success message with installation status
+
+    Raises:
+        Exception: If installation fails or times out
+    """
+    url = f"https://{ip_address}/mgmt/shared/iapp/package-management-tasks"
+
+    headers = {
+        "X-F5-Auth-Token": token,
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "operation": "INSTALL",
+        "packageFilePath": f"/var/config/rest/downloads/{rpm_filename}"
+    }
+
+    async with httpx.AsyncClient(verify=verify_ssl) as client:
+        try:
+            # Start installation task
+            response = await client.post(url, json=payload, headers=headers, timeout=30.0)
+            response.raise_for_status()
+
+            task_data = response.json()
+            task_id = task_data.get("id")
+
+            if not task_id:
+                raise Exception("No task ID returned from installation request")
+
+            # Poll for task completion (max 5 minutes)
+            task_url = f"{url}/{task_id}"
+            max_attempts = 60  # 5 minutes with 5-second intervals
+            attempt = 0
+
+            while attempt < max_attempts:
+                await asyncio.sleep(5)  # Wait 5 seconds between checks
+
+                status_response = await client.get(task_url, headers=headers, timeout=30.0)
+                status_response.raise_for_status()
+
+                status_data = status_response.json()
+                status = status_data.get("status")
+
+                if status == "FINISHED":
+                    return "AS3 installation completed successfully"
+                elif status == "FAILED":
+                    error_msg = status_data.get("errorMessage", "Unknown error")
+                    raise Exception(f"AS3 installation failed: {error_msg}")
+
+                attempt += 1
+
+            raise Exception("AS3 installation timed out after 5 minutes")
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                raise Exception("Authentication failed. AS3 installation requires admin account privileges.")
+            elif e.response.status_code == 403:
+                raise Exception("Permission denied. AS3 installation requires admin account (not just administrator role).")
+            raise Exception(f"Failed to install AS3 package: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            raise Exception(f"Error installing AS3 package: {str(e)}")
+
+
+# ============================================================================
 # MCP TOOLS
 # ============================================================================
 
@@ -404,6 +662,316 @@ async def list_bigip_devices(ctx: Context = None) -> str:
         if ctx:
             await ctx.error(f"Failed to load devices: {str(e)}")
         return f"❌ Error loading devices: {str(e)}"
+
+
+@mcp.tool
+async def manage_as3(
+    device_name: str,
+    action: str = "check",
+    auto_install: bool = False,
+    ctx: Context = None
+) -> str:
+    """
+    Check, install, or upgrade F5 AS3 (Application Services 3 Extension) on BIG-IP.
+
+    Args:
+        device_name: Name of the BIG-IP device from configuration file
+        action: Action to perform - "check" (default), "install", or "upgrade"
+        auto_install: Set to True to proceed with installation/upgrade (default: False)
+
+    Returns:
+        Status message with AS3 version information and installation results
+    """
+    if ctx:
+        await ctx.info(f"Starting AS3 management for device: {device_name}")
+
+    # Validate action parameter
+    if action not in ["check", "install", "upgrade"]:
+        return f"❌ Invalid action '{action}'. Must be 'check', 'install', or 'upgrade'."
+
+    # Load device configuration
+    try:
+        device = get_device_by_name(device_name)
+        if ctx:
+            await ctx.info(f"Loaded configuration for {device_name} ({device.ip_address})")
+    except Exception as e:
+        return f"❌ Configuration error: {str(e)}"
+
+    # Create credentials object from config
+    credentials = BIGIPCredentials(
+        ip_address=device.ip_address,
+        username=device.username,
+        password=device.password,
+        verify_ssl=device.verify_ssl
+    )
+
+    # Check if we have a cached valid token for this device
+    cached_token = None
+    if ctx:
+        cached_token = ctx.get_state(f"bigip_token_{device_name}")
+
+    token_obj = None
+
+    # Check if cached token is still valid
+    if cached_token:
+        token_obj = AuthToken(**cached_token)
+        if token_obj.expires_at > datetime.now():
+            if ctx:
+                await ctx.info("Using cached authentication token")
+        else:
+            if ctx:
+                await ctx.info("Cached token expired, will re-authenticate")
+            token_obj = None
+
+    # Authenticate if we don't have a valid token
+    if not token_obj:
+        if ctx:
+            await ctx.info(f"Authenticating to BIG-IP at {credentials.ip_address}")
+
+        try:
+            token_obj = await authenticate_bigip(credentials)
+            if ctx:
+                ctx.set_state(f"bigip_token_{device_name}", token_obj.model_dump())
+                await ctx.info("Successfully authenticated to BIG-IP")
+        except Exception as e:
+            if ctx:
+                await ctx.error(f"Authentication failed: {str(e)}")
+            return f"❌ Authentication failed: {str(e)}"
+
+    # Check current AS3 installation status
+    if ctx:
+        await ctx.info("Checking AS3 installation status")
+
+    try:
+        installed_version = await check_as3_installed(
+            ip_address=credentials.ip_address,
+            token=token_obj.token,
+            verify_ssl=credentials.verify_ssl
+        )
+
+        if ctx:
+            if installed_version:
+                await ctx.info(f"AS3 version {installed_version} is currently installed")
+            else:
+                await ctx.info("AS3 is not currently installed")
+
+    except Exception as e:
+        if ctx:
+            await ctx.error(f"Failed to check AS3 status: {str(e)}")
+        return f"❌ Failed to check AS3 status: {str(e)}"
+
+    # Fetch latest AS3 version from GitHub
+    if ctx:
+        await ctx.info("Fetching latest AS3 release information from GitHub")
+
+    try:
+        latest_release = await get_latest_as3_release()
+        latest_version = latest_release["version"]
+
+        if ctx:
+            await ctx.info(f"Latest AS3 version available: {latest_version}")
+
+    except Exception as e:
+        if ctx:
+            await ctx.error(f"Failed to fetch latest AS3 release: {str(e)}")
+        return f"❌ Failed to fetch latest AS3 release: {str(e)}"
+
+    # Handle "check" action
+    if action == "check":
+        output = [f"## AS3 Status on {device_name} ({credentials.ip_address})\n"]
+
+        if installed_version:
+            output.append(f"**Installed Version:** {installed_version}")
+        else:
+            output.append("**Installed Version:** Not installed")
+
+        output.append(f"**Latest Available:** {latest_version}")
+
+        # Determine recommendation
+        if not installed_version:
+            output.append("\n**Recommendation:** AS3 is not installed.")
+            output.append(f"To install: `manage_as3(device_name='{device_name}', action='install', auto_install=True)`")
+        elif installed_version != latest_version:
+            output.append(f"\n**Recommendation:** Newer version available ({latest_version}).")
+            output.append(f"To upgrade: `manage_as3(device_name='{device_name}', action='upgrade', auto_install=True)`")
+        else:
+            output.append("\n✅ **Status:** AS3 is up to date!")
+
+        return "\n".join(output)
+
+    # Handle "install" action
+    if action == "install":
+        if installed_version:
+            return (f"ℹ️ AS3 version {installed_version} is already installed on {device_name}. "
+                   f"Use action='upgrade' to update to version {latest_version}.")
+
+        if not auto_install:
+            return (f"⚠️ AS3 is not installed. Latest version: {latest_version}\n\n"
+                   f"To proceed with installation, run:\n"
+                   f"`manage_as3(device_name='{device_name}', action='install', auto_install=True)`\n\n"
+                   f"**Note:** AS3 installation requires admin account privileges.")
+
+        # Proceed with installation
+        if ctx:
+            await ctx.info(f"Starting AS3 {latest_version} installation")
+
+        try:
+            # Download RPM
+            if ctx:
+                await ctx.info(f"Downloading AS3 RPM from GitHub: {latest_release['rpm_filename']}")
+
+            rpm_content = await download_as3_rpm(
+                rpm_url=latest_release["rpm_url"],
+                rpm_filename=latest_release["rpm_filename"]
+            )
+
+            if ctx:
+                await ctx.info(f"Downloaded {len(rpm_content)} bytes")
+
+            # Upload RPM to BIG-IP
+            if ctx:
+                await ctx.info(f"Uploading RPM to BIG-IP at {credentials.ip_address}")
+
+            await upload_as3_rpm(
+                ip_address=credentials.ip_address,
+                token=token_obj.token,
+                rpm_filename=latest_release["rpm_filename"],
+                rpm_content=rpm_content,
+                verify_ssl=credentials.verify_ssl
+            )
+
+            if ctx:
+                await ctx.info("RPM upload completed successfully")
+
+            # Install package
+            if ctx:
+                await ctx.info("Starting AS3 package installation (this may take a few minutes)")
+
+            install_result = await install_as3_package(
+                ip_address=credentials.ip_address,
+                token=token_obj.token,
+                rpm_filename=latest_release["rpm_filename"],
+                verify_ssl=credentials.verify_ssl
+            )
+
+            if ctx:
+                await ctx.info(install_result)
+
+            # Verify installation
+            if ctx:
+                await ctx.info("Verifying AS3 installation")
+
+            # Wait a moment for AS3 to fully initialize
+            await asyncio.sleep(5)
+
+            verified_version = await check_as3_installed(
+                ip_address=credentials.ip_address,
+                token=token_obj.token,
+                verify_ssl=credentials.verify_ssl
+            )
+
+            if verified_version:
+                return (f"✅ **AS3 Installation Successful!**\n\n"
+                       f"Device: {device_name} ({credentials.ip_address})\n"
+                       f"Installed Version: {verified_version}\n"
+                       f"Status: AS3 is now ready to use")
+            else:
+                return (f"⚠️ Installation completed but AS3 verification failed. "
+                       f"The package may still be initializing. Please wait a moment and check again.")
+
+        except Exception as e:
+            if ctx:
+                await ctx.error(f"AS3 installation failed: {str(e)}")
+            return f"❌ AS3 installation failed: {str(e)}"
+
+    # Handle "upgrade" action
+    if action == "upgrade":
+        if not installed_version:
+            return (f"ℹ️ AS3 is not currently installed on {device_name}. "
+                   f"Use action='install' to install version {latest_version}.")
+
+        if installed_version == latest_version:
+            return f"✅ AS3 is already at the latest version ({latest_version}) on {device_name}."
+
+        if not auto_install:
+            return (f"⚠️ AS3 upgrade available: {installed_version} → {latest_version}\n\n"
+                   f"To proceed with upgrade, run:\n"
+                   f"`manage_as3(device_name='{device_name}', action='upgrade', auto_install=True)`\n\n"
+                   f"**Note:** AS3 installation requires admin account privileges.")
+
+        # Proceed with upgrade (same process as install)
+        if ctx:
+            await ctx.info(f"Starting AS3 upgrade from {installed_version} to {latest_version}")
+
+        try:
+            # Download RPM
+            if ctx:
+                await ctx.info(f"Downloading AS3 RPM from GitHub: {latest_release['rpm_filename']}")
+
+            rpm_content = await download_as3_rpm(
+                rpm_url=latest_release["rpm_url"],
+                rpm_filename=latest_release["rpm_filename"]
+            )
+
+            if ctx:
+                await ctx.info(f"Downloaded {len(rpm_content)} bytes")
+
+            # Upload RPM to BIG-IP
+            if ctx:
+                await ctx.info(f"Uploading RPM to BIG-IP at {credentials.ip_address}")
+
+            await upload_as3_rpm(
+                ip_address=credentials.ip_address,
+                token=token_obj.token,
+                rpm_filename=latest_release["rpm_filename"],
+                rpm_content=rpm_content,
+                verify_ssl=credentials.verify_ssl
+            )
+
+            if ctx:
+                await ctx.info("RPM upload completed successfully")
+
+            # Install package
+            if ctx:
+                await ctx.info("Starting AS3 package upgrade (this may take a few minutes)")
+
+            install_result = await install_as3_package(
+                ip_address=credentials.ip_address,
+                token=token_obj.token,
+                rpm_filename=latest_release["rpm_filename"],
+                verify_ssl=credentials.verify_ssl
+            )
+
+            if ctx:
+                await ctx.info(install_result)
+
+            # Verify installation
+            if ctx:
+                await ctx.info("Verifying AS3 upgrade")
+
+            # Wait a moment for AS3 to fully initialize
+            await asyncio.sleep(5)
+
+            verified_version = await check_as3_installed(
+                ip_address=credentials.ip_address,
+                token=token_obj.token,
+                verify_ssl=credentials.verify_ssl
+            )
+
+            if verified_version == latest_version:
+                return (f"✅ **AS3 Upgrade Successful!**\n\n"
+                       f"Device: {device_name} ({credentials.ip_address})\n"
+                       f"Previous Version: {installed_version}\n"
+                       f"New Version: {verified_version}\n"
+                       f"Status: AS3 is now ready to use")
+            else:
+                return (f"⚠️ Upgrade completed but verification returned version {verified_version}. "
+                       f"The package may still be initializing. Please wait a moment and check again.")
+
+        except Exception as e:
+            if ctx:
+                await ctx.error(f"AS3 upgrade failed: {str(e)}")
+            return f"❌ AS3 upgrade failed: {str(e)}"
 
 
 # ============================================================================

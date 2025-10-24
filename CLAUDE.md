@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Model Context Protocol (MCP) server** for managing F5 BIG-IP load balancers, built with FastMCP 2.0. It exposes BIG-IP management capabilities (virtual server listing, authentication) to MCP-compatible clients like Claude Desktop.
+This is a **Model Context Protocol (MCP) server** for managing F5 BIG-IP load balancers, built with FastMCP 2.0. It exposes BIG-IP management capabilities (virtual server listing, AS3 extension management, authentication) to MCP-compatible clients like Claude Desktop.
 
 ## Development Commands
 
@@ -76,13 +76,37 @@ Check logs at `~/Library/Logs/Claude/mcp-server-bigip.log` (macOS)
   - Auth: `X-F5-Auth-Token` header
   - Returns: List of VirtualServer Pydantic models
 
-**MCP Tools** (`server.py:233-336`)
+**AS3 Management Helpers** (`server.py:235-490`)
+- `get_latest_as3_release()` - Fetches latest AS3 version from GitHub API
+  - Endpoint: `GET https://api.github.com/repos/F5Networks/f5-appsvcs-extension/releases/latest`
+  - Returns: version, rpm_url, rpm_filename, sha256_url
+- `check_as3_installed()` - Checks if AS3 is installed and returns version
+  - Endpoint: `GET https://{bigip}/mgmt/shared/appsvcs/info`
+  - Returns: Version string or None if not installed
+- `download_as3_rpm()` - Downloads AS3 RPM from GitHub
+- `upload_as3_rpm()` - Uploads RPM to BIG-IP file transfer endpoint
+  - Endpoint: `POST https://{bigip}/mgmt/shared/file-transfer/uploads/{filename}`
+  - Uses Content-Range header for file size
+- `install_as3_package()` - Installs RPM and polls until complete
+  - Endpoint: `POST https://{bigip}/mgmt/shared/iapp/package-management-tasks`
+  - Polls task status every 5 seconds with 5-minute timeout
+
+**MCP Tools** (`server.py:492-974`)
 - `list_virtual_servers(device_name)` - Main tool for querying virtual servers
   - Reads credentials from config (no passwords in prompts)
   - Implements token caching via `ctx.set_state()`/`ctx.get_state()`
   - Tokens cached per-device with key `bigip_token_{device_name}`
+  - Returns markdown table with status indicators
 
 - `list_bigip_devices()` - Lists all configured devices from config file
+
+- `manage_as3(device_name, action, auto_install)` - Manages AS3 installation/upgrades
+  - Actions: "check" (default), "install", "upgrade"
+  - Two-step confirmation: requires `auto_install=True` to proceed
+  - Fetches latest AS3 from GitHub automatically
+  - Compares installed vs available versions
+  - Handles download → upload → install → verify workflow
+  - Requires admin account (not just administrator role)
 
 ### Key Design Decisions
 
@@ -100,14 +124,24 @@ Check logs at `~/Library/Logs/Claude/mcp-server-bigip.log` (macOS)
 - Default `verify_ssl=false` for lab environments with self-signed certs
 - Production devices should set `verify_ssl=true` in config
 
+**AS3 Management:**
+- Always fetches latest version from GitHub (no version pinning)
+- Two-step confirmation prevents accidental installations (`auto_install` parameter)
+- Polls installation status to provide real-time feedback
+- Admin account required (detected via 401/403 errors with clear messaging)
+- GitHub download happens on MCP server (not BIG-IP), then uploaded
+- 5-minute timeout for installations (typical install: 2-5 minutes)
+
 ### Data Models (Pydantic)
 
 ```python
 BIGIPDevice      # Config file device entry (ip, username, password, verify_ssl, description)
 BIGIPCredentials # Runtime credentials (ip, username, password, verify_ssl)
 AuthToken        # Cached token (token, expires_at)
-VirtualServer    # API response (name, full_path, destination, enabled, availability_status, description)
+VirtualServer    # API response (name, full_path, destination, pool, enabled, availability_status, description)
 ```
+
+Note: AS3 management uses Dict types for GitHub API responses (no dedicated Pydantic models).
 
 ## Common Modifications
 
@@ -141,6 +175,32 @@ expires_at = datetime.now() + timedelta(seconds=1140)  # 19 minutes
 1. Update `BIGIPDevice` Pydantic model (line 29)
 2. Update `bigip_config.example.json`
 3. Update `CONFIGURATION.md` with field documentation
+
+### Modifying AS3 Version Selection
+
+Current implementation always fetches latest from GitHub. To pin to specific version:
+
+1. Modify `get_latest_as3_release()` to accept optional version parameter
+2. If version specified, construct GitHub release URL: `https://api.github.com/repos/F5Networks/f5-appsvcs-extension/releases/tags/v{version}`
+3. Update `manage_as3` tool to accept `version` parameter
+4. Document version format in tool docstring (e.g., "3.54.2")
+
+### Adding AS3 Uninstall Capability
+
+1. Add `uninstall_as3_package()` helper function
+2. Use same package-management-tasks endpoint with `"operation": "UNINSTALL"`
+3. Package name format: `f5-appsvcs-{version}.noarch` (extract from RPM filename)
+4. Add "uninstall" action to `manage_as3` tool
+5. Require `auto_install=True` confirmation for uninstall
+
+### Adding AS3 Declaration Deployment
+
+AS3 uses `/mgmt/shared/appsvcs/declare` endpoint for deploying configurations:
+1. Create new tool `deploy_as3(device_name, declaration)`
+2. `declaration` parameter should accept JSON string or dict
+3. POST declaration to `/mgmt/shared/appsvcs/declare`
+4. Poll `/mgmt/shared/appsvcs/task/{taskId}` for completion
+5. Return deployment results
 
 ## File Structure
 

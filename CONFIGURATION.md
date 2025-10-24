@@ -78,6 +78,36 @@ Or:
 Show me the virtual servers on the lab-bigip device
 ```
 
+### Manage AS3:
+```
+Check AS3 status on prod-lb-01
+Install AS3 on lab-bigip
+Upgrade AS3 on prod-lb-01
+```
+
+## AS3 Requirements
+
+### Account Permissions
+- **Admin account required** - AS3 installation requires the `admin` user account (not just a user with administrator role)
+- If your config uses a non-admin account, AS3 operations will fail with a permission error
+- Consider creating a separate device entry in your config with admin credentials for AS3 management
+
+### BIG-IP Version
+- BIG-IP 14.0+ required for AS3 token-based authentication
+- BIG-IP 14.1+ recommended for AS3 version 3.50.0 and later
+- Tested with BIG-IP 13.x, 14.x, 15.x, 16.x, 17.x
+
+### Network Access
+- Outbound HTTPS access to `github.com` required for downloading AS3 RPM packages
+- GitHub API access required for fetching latest release information
+- If behind a firewall, ensure these domains are whitelisted
+
+### Installation Notes
+- AS3 installation typically takes 2-5 minutes
+- The tool polls installation status every 5 seconds with a 5-minute timeout
+- After installation, AS3 may take an additional 5-10 seconds to fully initialize
+- For HA clusters, install on the active device first, then synchronize
+
 ## Troubleshooting
 
 ### "Configuration file not found"
@@ -98,6 +128,29 @@ Show me the virtual servers on the lab-bigip device
 - Verify credentials are correct in `bigip_config.json`
 - Check network connectivity to the BIG-IP
 - Ensure the user account has API access permissions
+
+### AS3 installation failures
+
+**"Permission denied. AS3 installation requires admin account"**
+- The user in your config must be the `admin` account
+- Regular users with administrator role will NOT work
+- Create a separate device entry with admin credentials for AS3 operations
+
+**"Failed to download AS3 RPM"**
+- Verify outbound internet access to GitHub
+- Check firewall rules allow HTTPS to `github.com`
+- Temporarily try from a browser to confirm connectivity
+
+**"AS3 installation timed out after 5 minutes"**
+- BIG-IP may be slow or under load
+- Check BIG-IP system resources (CPU, memory)
+- Try again during off-peak hours
+- Use BIG-IP GUI to check package management tasks
+
+**"Installation completed but AS3 verification failed"**
+- AS3 may still be initializing (wait 30 seconds and check again)
+- Check BIG-IP logs: `/var/log/restjavad.0.log`
+- Verify AS3 package installed via BIG-IP GUI: iApps > Package Management LX
 
 ## Advanced Configuration
 

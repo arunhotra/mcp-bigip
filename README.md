@@ -8,6 +8,7 @@ A Model Context Protocol (MCP) server for managing F5 BIG-IP devices. Built with
 - **Multi-Device Support** - Manage multiple BIG-IP devices from a single server
 - **Token Caching** - Automatically caches authentication tokens and reuses until expiry
 - **Virtual Server Management** - List all virtual servers with status and configuration
+- **AS3 Management** - Check, install, and upgrade F5 Application Services 3 Extension
 - **SSL Flexibility** - Support for self-signed certificates (common in lab environments)
 - **Async/Await** - Non-blocking I/O for responsive performance
 
@@ -173,6 +174,36 @@ List virtual servers on prod-lb-01
 - Automatically authenticates and caches token
 - Token reused for 19 minutes before re-authentication
 
+### `manage_as3`
+Check, install, or upgrade F5 AS3 (Application Services 3 Extension) on BIG-IP devices.
+
+**Parameters:**
+- `device_name` - Name of the device from config file (e.g., 'prod-lb-01')
+- `action` - Action to perform: "check" (default), "install", or "upgrade"
+- `auto_install` - Set to True to proceed with installation/upgrade (default: False)
+
+**Usage:**
+```
+Check AS3 status on prod-lb-01
+Install AS3 on lab-bigip
+Upgrade AS3 on prod-lb-01
+```
+
+**Returns:** AS3 version information and installation/upgrade results
+
+**Features:**
+- Automatically fetches latest AS3 version from GitHub
+- Downloads and uploads RPM to BIG-IP
+- Polls installation task until completion
+- Verifies installation after completion
+- Supports version comparison and upgrade recommendations
+- Two-step confirmation with `auto_install` parameter prevents accidental installations
+
+**Requirements:**
+- AS3 installation requires admin account (not just administrator role)
+- Network access to GitHub for downloading RPM packages
+- BIG-IP 14.1+ recommended for AS3 3.50+
+
 ### Resources
 
 - **`config://server`** - Server configuration and capabilities
@@ -260,6 +291,21 @@ Can you show me the virtual servers on the lab-bigip device?
 **Check Multiple Devices:**
 ```
 List virtual servers on prod-lb-01 and then on prod-lb-02
+```
+
+**Check AS3 Status:**
+```
+Check AS3 status on prod-lb-01
+```
+
+**Install AS3:**
+```
+Install AS3 on lab-bigip
+```
+
+**Upgrade AS3:**
+```
+Upgrade AS3 on prod-lb-01 if a newer version is available
 ```
 
 ### Workflow
