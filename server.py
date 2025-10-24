@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import json
 import os
 import asyncio
+import re
 from pathlib import Path
 
 
@@ -488,6 +489,445 @@ async def install_as3_package(
             raise Exception(f"Failed to install AS3 package: {e.response.status_code} - {e.response.text}")
         except Exception as e:
             raise Exception(f"Error installing AS3 package: {str(e)}")
+
+
+# ============================================================================
+# AS3 APPLICATION CREATION HELPERS
+# ============================================================================
+
+def load_as3_template(template_name: str) -> Dict:
+    """
+    Load AS3 template from templates directory.
+
+    Args:
+        template_name: Name of the template (without .json extension)
+
+    Returns:
+        Template as Python dictionary
+
+    Raises:
+        Exception: If template file not found or invalid JSON
+    """
+    template_path = Path(__file__).parent / "templates" / f"{template_name}.json"
+
+    if not template_path.exists():
+        # List available templates
+        templates_dir = Path(__file__).parent / "templates"
+        if templates_dir.exists():
+            available = [f.stem for f in templates_dir.glob("*.json")]
+            if available:
+                raise Exception(
+                    f"Template '{template_name}' not found. "
+                    f"Available templates: {', '.join(available)}"
+                )
+        raise Exception(
+            f"Template '{template_name}' not found. "
+            f"No templates directory found at {templates_dir}"
+        )
+
+    try:
+        with open(template_path, 'r') as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        raise Exception(f"Invalid JSON in template '{template_name}': {str(e)}")
+    except Exception as e:
+        raise Exception(f"Error loading template '{template_name}': {str(e)}")
+
+
+def render_as3_template(template: Dict, variables: Dict) -> Dict:
+    """
+    Render AS3 template by replacing variable placeholders.
+
+    Variable format: {{VARIABLE_NAME}}
+    Special handling for arrays: {{POOL_MEMBERS}} expects a list and converts to JSON array
+
+    Args:
+        template: Template dictionary with {{VARIABLE}} placeholders
+        variables: Dictionary of variable names to values
+
+    Returns:
+        Rendered template with all variables substituted
+
+    Raises:
+        Exception: If required variables are missing
+    """
+    # Convert template to JSON string for easy substitution
+    template_str = json.dumps(template, indent=2)
+
+    # Track which variables were found in template
+    found_vars = set()
+
+    # Replace each variable
+    for var_name, var_value in variables.items():
+        placeholder = f"{{{{{var_name}}}}}"
+
+        if placeholder in template_str:
+            found_vars.add(var_name)
+
+            # Special handling for list/array variables
+            if isinstance(var_value, list):
+                # Convert list to JSON array string
+                var_value_str = json.dumps(var_value)
+            else:
+                var_value_str = str(var_value)
+
+            template_str = template_str.replace(placeholder, var_value_str)
+
+    # Check for any remaining unreplaced variables
+    import re
+    remaining_vars = re.findall(r'\{\{([A-Z_]+)\}\}', template_str)
+    if remaining_vars:
+        raise Exception(
+            f"Template has unreplaced variables: {', '.join(set(remaining_vars))}. "
+            f"Provided variables: {', '.join(variables.keys())}"
+        )
+
+    # Convert back to dictionary
+    try:
+        return json.loads(template_str)
+    except json.JSONDecodeError as e:
+        raise Exception(f"Error rendering template (invalid JSON after substitution): {str(e)}")
+
+
+def validate_as3_declaration(declaration: Dict) -> tuple[bool, str]:
+    """
+    Validate AS3 declaration structure and content.
+
+    Args:
+        declaration: AS3 declaration dictionary
+
+    Returns:
+        Tuple of (is_valid, error_message)
+        If valid: (True, "")
+        If invalid: (False, "error description")
+    """
+    # Check required top-level fields
+    if "class" not in declaration or declaration["class"] != "AS3":
+        return False, "Declaration must have 'class': 'AS3'"
+
+    if "declaration" not in declaration:
+        return False, "Declaration must have 'declaration' property"
+
+    decl = declaration["declaration"]
+
+    if "class" not in decl or decl["class"] != "ADC":
+        return False, "Declaration.class must be 'ADC'"
+
+    # Validate IP addresses in virtualAddresses
+    import re
+    ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+
+    def validate_ip(ip_str):
+        """Validate IP address format"""
+        if not ip_pattern.match(ip_str):
+            return False
+        octets = ip_str.split('.')
+        return all(0 <= int(octet) <= 255 for octet in octets)
+
+    def check_virtual_addresses(obj, path=""):
+        """Recursively find and validate virtualAddresses"""
+        if isinstance(obj, dict):
+            if "virtualAddresses" in obj:
+                addrs = obj["virtualAddresses"]
+                if not isinstance(addrs, list):
+                    return False, f"virtualAddresses at {path} must be a list"
+                for addr in addrs:
+                    if not validate_ip(addr):
+                        return False, f"Invalid IP address '{addr}' at {path}.virtualAddresses"
+
+            for key, value in obj.items():
+                is_valid, msg = check_virtual_addresses(value, f"{path}.{key}")
+                if not is_valid:
+                    return is_valid, msg
+
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                is_valid, msg = check_virtual_addresses(item, f"{path}[{i}]")
+                if not is_valid:
+                    return is_valid, msg
+
+        return True, ""
+
+    # Validate IPs in declaration
+    is_valid, error_msg = check_virtual_addresses(decl)
+    if not is_valid:
+        return False, error_msg
+
+    return True, ""
+
+
+async def deploy_as3_declaration(
+    ip_address: str,
+    token: str,
+    declaration: Dict,
+    verify_ssl: bool = False
+) -> str:
+    """
+    Deploy AS3 declaration to BIG-IP.
+
+    Args:
+        ip_address: BIG-IP management IP
+        token: Authentication token
+        declaration: AS3 declaration dictionary
+        verify_ssl: Whether to verify SSL certificates
+
+    Returns:
+        Success message with deployment details
+
+    Raises:
+        Exception: If deployment fails or times out
+    """
+    url = f"https://{ip_address}/mgmt/shared/appsvcs/declare"
+
+    headers = {
+        "X-F5-Auth-Token": token,
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient(verify=verify_ssl) as client:
+        try:
+            # Deploy declaration
+            response = await client.post(
+                url,
+                json=declaration,
+                headers=headers,
+                timeout=60.0  # Initial POST timeout
+            )
+            response.raise_for_status()
+
+            result = response.json()
+
+            # AS3 returns immediate result or task ID
+            # Check if deployment is synchronous or asynchronous
+            if result.get("results"):
+                # Synchronous response
+                results = result["results"]
+                # Check for errors in results
+                for tenant_result in results:
+                    if isinstance(tenant_result, dict):
+                        if tenant_result.get("code") not in [200, 201]:
+                            message = tenant_result.get("message", "Unknown error")
+                            return f"AS3 deployment failed: {message}"
+
+                return "AS3 declaration deployed successfully"
+
+            # If we get a task ID, poll for completion
+            task_id = result.get("id")
+            if task_id:
+                # Poll task endpoint
+                task_url = f"https://{ip_address}/mgmt/shared/appsvcs/task/{task_id}"
+                max_attempts = 120  # 10 minutes with 5-second intervals
+                attempt = 0
+
+                while attempt < max_attempts:
+                    await asyncio.sleep(5)
+
+                    status_response = await client.get(task_url, headers=headers, timeout=30.0)
+                    status_response.raise_for_status()
+
+                    status_data = status_response.json()
+
+                    # Check if task is complete
+                    results = status_data.get("results", [])
+                    if results:
+                        # Check for errors
+                        for tenant_result in results:
+                            if isinstance(tenant_result, dict):
+                                code = tenant_result.get("code", 0)
+                                if code not in [200, 201, 202]:
+                                    message = tenant_result.get("message", "Unknown error")
+                                    return f"AS3 deployment failed: {message}"
+
+                        return "AS3 declaration deployed successfully"
+
+                    attempt += 1
+
+                raise Exception("AS3 deployment timed out after 10 minutes")
+
+            # No task ID and no immediate results
+            return "AS3 declaration submitted (status unknown)"
+
+        except httpx.HTTPStatusError as e:
+            error_text = e.response.text
+            try:
+                error_json = json.loads(error_text)
+                error_msg = error_json.get("message", error_text)
+            except:
+                error_msg = error_text
+
+            raise Exception(f"AS3 deployment failed: {e.response.status_code} - {error_msg}")
+        except Exception as e:
+            raise Exception(f"Error deploying AS3 declaration: {str(e)}")
+
+
+# ============================================================================
+# PHPIPAM INTEGRATION HELPERS
+# ============================================================================
+
+async def reserve_vip_from_phpipam(subnet_id: str, hostname: str) -> str:
+    """
+    Reserve first available IP from phpIPAM subnet for virtual server.
+
+    Note: This function assumes phpIPAM MCP server is available and will be called
+    by Claude. It returns instructions for Claude to call the phpIPAM tool.
+
+    Args:
+        subnet_id: phpIPAM subnet ID
+        hostname: Hostname for the IP reservation
+
+    Returns:
+        Instruction string for Claude to call phpIPAM
+
+    Raises:
+        Exception: This function should not be called directly - it's a placeholder
+    """
+    raise Exception(
+        "This function is a placeholder. Claude should call the phpIPAM MCP server's "
+        f"reserve_ip_address tool with subnet_id='{subnet_id}' and hostname='{hostname}'"
+    )
+
+
+async def get_reserved_ips_from_phpipam(subnet_id: str) -> Dict:
+    """
+    Get all reserved IP addresses from phpIPAM subnet.
+
+    Note: This function assumes phpIPAM MCP server is available and will be called
+    by Claude. It returns instructions for Claude to call the phpIPAM tool.
+
+    Args:
+        subnet_id: phpIPAM subnet ID
+
+    Returns:
+        Instruction string for Claude to call phpIPAM
+
+    Raises:
+        Exception: This function should not be called directly - it's a placeholder
+    """
+    raise Exception(
+        "This function is a placeholder. Claude should call the phpIPAM MCP server's "
+        f"get_subnet_details tool with subnet_id='{subnet_id}' and include_addresses=True"
+    )
+
+
+def parse_pool_selection(selection: str, available_ips: List[Dict]) -> List[str]:
+    """
+    Parse user's pool member selection from text input.
+
+    Supports formats:
+    - Numbers: "1 and 2", "1, 2", "1,2"
+    - IPs: "172.16.100.10 and 172.16.100.11"
+    - Hostnames: "web-mkt-01 and web-mkt-02"
+    - Mixed: "1 and 172.16.100.11"
+
+    Args:
+        selection: User's selection text
+        available_ips: List of available IP dictionaries from phpIPAM
+                       Format: [{"ip": "172.16.100.10", "hostname": "web-mkt-01"}, ...]
+
+    Returns:
+        List of selected IP addresses
+
+    Raises:
+        Exception: If selection cannot be parsed or IPs not found
+    """
+    if not selection or not selection.strip():
+        raise Exception("No pool member selection provided")
+
+    selection = selection.lower().strip()
+    selected_ips = []
+
+    # Extract numbers (for numbered selections like "1 and 2")
+    numbers = re.findall(r'\d+', selection)
+
+    # Extract IP addresses
+    ip_pattern = r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+    ips_in_selection = re.findall(ip_pattern, selection)
+
+    # Build mapping of index -> IP and hostname -> IP
+    index_to_ip = {}
+    hostname_to_ip = {}
+    all_ips = []
+
+    for idx, ip_info in enumerate(available_ips, start=1):
+        ip = ip_info.get('ip', '')
+        hostname = ip_info.get('hostname', '').lower()
+
+        index_to_ip[str(idx)] = ip
+        if hostname:
+            hostname_to_ip[hostname] = ip
+        all_ips.append(ip)
+
+    # Process numbers (highest priority)
+    for num in numbers:
+        if num in index_to_ip:
+            ip = index_to_ip[num]
+            if ip not in selected_ips:
+                selected_ips.append(ip)
+
+    # Process explicit IPs
+    for ip in ips_in_selection:
+        if ip in all_ips and ip not in selected_ips:
+            selected_ips.append(ip)
+
+    # Process hostnames (if no numbers or IPs matched)
+    if not selected_ips:
+        for hostname, ip in hostname_to_ip.items():
+            if hostname in selection and ip not in selected_ips:
+                selected_ips.append(ip)
+
+    if not selected_ips:
+        raise Exception(
+            f"Could not parse selection '{selection}'. "
+            f"Please provide numbers (e.g., '1 and 2'), "
+            f"IPs (e.g., '172.16.100.10 and 172.16.100.11'), "
+            f"or hostnames"
+        )
+
+    return selected_ips
+
+
+def format_pool_selection_prompt(subnet_info: Dict, reserved_ips: List[Dict]) -> str:
+    """
+    Format the pool member selection prompt for user.
+
+    Args:
+        subnet_info: Subnet information dict
+        reserved_ips: List of reserved IP dicts from phpIPAM
+
+    Returns:
+        Formatted string prompting user to select pool members
+    """
+    if not reserved_ips:
+        return (
+            f"❌ No reserved IP addresses found in subnet {subnet_info.get('subnet', 'unknown')}. "
+            "Please reserve some IPs first using phpIPAM before creating the application."
+        )
+
+    output = [
+        f"## Available Web Servers\n",
+        f"**Subnet:** {subnet_info.get('subnet', 'unknown')}/{subnet_info.get('mask', '?')}",
+        f"**Description:** {subnet_info.get('description', 'N/A')}\n",
+        f"Found {len(reserved_ips)} reserved IP(s):\n"
+    ]
+
+    for idx, ip_info in enumerate(reserved_ips, start=1):
+        ip = ip_info.get('ip', 'unknown')
+        hostname = ip_info.get('hostname', 'N/A')
+        description = ip_info.get('description', '')
+
+        line = f"{idx}. **{ip}** - {hostname}"
+        if description:
+            line += f" ({description[:50]})"
+
+        output.append(line)
+
+    output.append("\n**Next Step:** Please specify which servers to include in the pool.")
+    output.append("Examples:")
+    output.append("- By number: `Use 1 and 2`")
+    output.append("- By IP: `Use 172.16.100.10 and 172.16.100.11`")
+    output.append("- By hostname: `Use web-mkt-01 and web-mkt-02`")
+
+    return "\n".join(output)
 
 
 # ============================================================================
@@ -974,6 +1414,269 @@ async def manage_as3(
             return f"❌ AS3 upgrade failed: {str(e)}"
 
 
+@mcp.tool
+async def create_as3_app(
+    device_name: str,
+    section_name: str,
+    vip_subnet_id: str,
+    pool_subnet_id: str,
+    pool_member_selection: str = None,
+    virtual_ip: str = None,
+    pool_members: List[str] = None,
+    app_name: str = None,
+    template_name: str = None,
+    auto_deploy: bool = False,
+    ctx: Context = None
+) -> str:
+    """
+    Create AS3 application with IP allocation from phpIPAM.
+
+    This tool demonstrates cross-MCP-server integration with phpIPAM MCP server.
+
+    Two usage modes:
+
+    Mode 1: Direct deployment (when IPs are already known)
+        - Provide virtual_ip and pool_members directly
+        - Set auto_deploy=True to deploy immediately
+
+    Mode 2: Guided workflow (Claude orchestrates phpIPAM calls)
+        - Claude calls phpIPAM to reserve VIP and get pool options
+        - User selects pool members
+        - Claude calls this tool with results
+
+    Args:
+        device_name: BIG-IP device from config file (e.g., 'lab-bigip')
+        section_name: phpIPAM section name (e.g., 'marketing')
+        vip_subnet_id: phpIPAM subnet ID for virtual server IP (e.g., '8')
+        pool_subnet_id: phpIPAM subnet ID for pool member IPs (e.g., '7')
+        pool_member_selection: User's selection of pool members (e.g., '1 and 2', '172.16.100.3 and 172.16.100.4')
+                              Leave empty for guided mode
+        virtual_ip: Virtual server IP address (optional, for direct deployment)
+        pool_members: List of pool member IPs (optional, for direct deployment)
+        app_name: Application name (optional, defaults to '{section_name}_app')
+        template_name: Template to use (optional, defaults to section_name)
+        auto_deploy: Set to True to deploy without preview (default: False)
+
+    Returns:
+        - Pool selection prompt (guided mode without pool_member_selection)
+        - Preview (if pool_member_selection provided or direct mode, auto_deploy=False)
+        - Deployment status (if auto_deploy=True)
+
+    Example - Direct deployment:
+        create_as3_app(
+            device_name='lab-bigip',
+            section_name='marketing',
+            vip_subnet_id='8',
+            pool_subnet_id='7',
+            virtual_ip='192.168.50.3',
+            pool_members=['172.16.100.3', '172.16.100.4'],
+            auto_deploy=True
+        )
+    """
+    state_key = f"as3_app_{section_name}"
+
+    if ctx:
+        await ctx.info(f"AS3 app creation for section: {section_name}")
+
+    # Determine mode: Direct (IPs provided) or Guided (orchestrated via Claude)
+    if virtual_ip and pool_members:
+        # Mode 1: Direct deployment with provided IPs
+        if ctx:
+            await ctx.info(f"Direct deployment mode - VIP: {virtual_ip}, Pool: {pool_members}")
+        selected_ips = pool_members
+    else:
+        # Mode 2: Guided workflow with phpIPAM orchestration
+        # Step 1: Handle VIP reservation (auto or from cache)
+        app_state = ctx.get_state(state_key) if ctx else None
+
+        if app_state and app_state.get("virtual_ip"):
+            virtual_ip = app_state["virtual_ip"]
+            if ctx:
+                await ctx.info(f"Using cached VIP: {virtual_ip}")
+        else:
+            # Need to tell Claude to call phpIPAM to reserve VIP
+            return f"""## Step 1: Reserve Virtual IP
+
+To proceed, please use the phpIPAM MCP server to reserve a virtual IP:
+
+**Action needed:**
+Call phpIPAM's `reserve_ip_address` tool with:
+- `subnet_id`: `{vip_subnet_id}`
+- `hostname`: `{section_name}-vip`
+
+Once you have the reserved IP, call this tool again with the same parameters.
+
+**Note:** I'll cache the VIP for subsequent calls."""
+
+        # Step 2: Handle pool member selection
+        if not pool_member_selection:
+            # Need to tell Claude to get subnet details from phpIPAM
+            return f"""## Step 2: Show Pool Member Options
+
+**Virtual IP Reserved:** {virtual_ip} ✓
+
+To see available pool members, please use the phpIPAM MCP server:
+
+**Action needed:**
+Call phpIPAM's `get_subnet_details` tool with:
+- `subnet_id`: `{pool_subnet_id}`
+- `include_addresses`: `True`
+
+This will show all reserved IPs in the web servers subnet. Then specify which servers to use.
+
+**Example selections:**
+- By number: "1 and 2"
+- By IP: "172.16.100.10 and 172.16.100.11"
+- By hostname: "web-mkt-01 and web-mkt-02"
+"""
+
+        # Step 3: Parse pool selection (guided mode)
+        # This requires Claude to have already shown the user the list
+        # For now, we'll parse the selection text
+        try:
+            # Extract IPs from selection (support "1 and 2" format or IP format)
+            # Simple parsing: look for IP addresses in the selection
+            ip_pattern = r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+            selected_ips = re.findall(ip_pattern, pool_member_selection)
+
+            if not selected_ips:
+                # If no IPs found, assume user provided description like "1 and 2"
+                # We need the actual IPs from phpIPAM context
+                return f"""❌ Could not parse IP addresses from selection: '{pool_member_selection}'
+
+Please provide the actual IP addresses of the pool members you want to use.
+
+**Example:** "172.16.100.10 and 172.16.100.11"
+
+Or first show the available servers using phpIPAM's `get_subnet_details` tool."""
+
+            if len(selected_ips) < 2:
+                return f"❌ Please select at least 2 pool members. Found only: {selected_ips}"
+
+            selected_ips = selected_ips[:2]  # Use first 2 IPs
+
+        except Exception as e:
+            return f"❌ Error parsing pool selection: {str(e)}"
+
+    # Step 4: Load device config and authenticate
+    try:
+        device = get_device_by_name(device_name)
+        if ctx:
+            await ctx.info(f"Loaded BIG-IP config: {device_name}")
+    except Exception as e:
+        return f"❌ Configuration error: {str(e)}"
+
+    credentials = BIGIPCredentials(
+        ip_address=device.ip_address,
+        username=device.username,
+        password=device.password,
+        verify_ssl=device.verify_ssl
+    )
+
+    # Check for cached token
+    cached_token = ctx.get_state(f"bigip_token_{device_name}") if ctx else None
+    token_obj = None
+
+    if cached_token:
+        token_obj = AuthToken(**cached_token)
+        if token_obj.expires_at <= datetime.now():
+            token_obj = None
+
+    if not token_obj:
+        try:
+            token_obj = await authenticate_bigip(credentials)
+            if ctx:
+                ctx.set_state(f"bigip_token_{device_name}", token_obj.model_dump())
+        except Exception as e:
+            return f"❌ Authentication failed: {str(e)}"
+
+    # Step 5: Load and render template
+    template_to_use = template_name if template_name else section_name
+
+    try:
+        template = load_as3_template(template_to_use)
+    except Exception as e:
+        return f"❌ Failed to load template: {str(e)}"
+
+    app_name_final = app_name if app_name else f"{section_name}_app"
+    variables = {
+        "TENANT_NAME": section_name.title(),
+        "APP_NAME": app_name_final,
+        "VIRTUAL_IP": virtual_ip,
+    }
+
+    # Add individual pool member variables
+    for i, member_ip in enumerate(selected_ips, start=1):
+        variables[f"POOL_MEMBER_{i}"] = member_ip
+
+    try:
+        declaration = render_as3_template(template, variables)
+    except Exception as e:
+        return f"❌ Failed to render template: {str(e)}"
+
+    # Validate declaration
+    is_valid, error_msg = validate_as3_declaration(declaration)
+    if not is_valid:
+        return f"❌ Declaration validation failed: {error_msg}"
+
+    # Step 6: Preview or deploy
+    if not auto_deploy:
+        pool_members_str = "\n  - ".join([f"{ip}:80" for ip in selected_ips])
+
+        preview = f"""## AS3 Application Preview
+
+**Device:** {device_name} ({credentials.ip_address})
+**Tenant:** {variables['TENANT_NAME']}
+**Application:** {variables['APP_NAME']}
+
+### Configuration:
+- **Virtual Server IP:** {virtual_ip}:80
+- **Pool Members:**
+  - {pool_members_str}
+- **Load Balancing:** Round-robin
+- **Health Monitor:** HTTP
+
+### Template: {template_to_use}
+
+**To deploy:** Call this tool again with `auto_deploy=True`
+"""
+        return preview
+
+    # Deploy
+    if ctx:
+        await ctx.info("Deploying AS3 declaration")
+
+    try:
+        result = await deploy_as3_declaration(
+            ip_address=credentials.ip_address,
+            token=token_obj.token,
+            declaration=declaration,
+            verify_ssl=credentials.verify_ssl
+        )
+
+        # Clear cached state after successful deployment
+        if ctx:
+            ctx.set_state(state_key, None)
+
+        pool_members_str = ", ".join(selected_ips)
+        return f"""✅ **AS3 Application Deployed Successfully!**
+
+**Device:** {device_name} ({credentials.ip_address})
+**Tenant:** {variables['TENANT_NAME']}
+**Application:** {variables['APP_NAME']}
+
+### Configuration:
+- **Virtual Server:** {virtual_ip}:80
+- **Pool Members:** {pool_members_str}
+- **Status:** Active and ready to receive traffic
+
+The application is now live and will distribute traffic across the pool members.
+"""
+
+    except Exception as e:
+        return f"❌ Deployment failed: {str(e)}"
+
+
 # ============================================================================
 # RESOURCES
 # ============================================================================
@@ -992,6 +1695,77 @@ def get_server_config() -> str:
         ]
     }
     return json.dumps(config, indent=2)
+
+
+@mcp.resource("templates://available")
+def list_available_templates() -> str:
+    """List all available AS3 application templates"""
+    templates_dir = Path(__file__).parent / "templates"
+
+    if not templates_dir.exists():
+        return json.dumps({
+            "templates": [],
+            "message": "No templates directory found"
+        }, indent=2)
+
+    template_files = list(templates_dir.glob("*.json"))
+
+    templates = []
+    for template_file in template_files:
+        template_name = template_file.stem
+        try:
+            with open(template_file, 'r') as f:
+                template_data = json.load(f)
+
+            # Extract variables from template
+            template_str = json.dumps(template_data)
+            variables = re.findall(r'\{\{([A-Z_]+)\}\}', template_str)
+            unique_vars = list(set(variables))
+
+            templates.append({
+                "name": template_name,
+                "file": template_file.name,
+                "variables": unique_vars,
+                "description": f"AS3 template for {template_name} applications"
+            })
+        except Exception as e:
+            templates.append({
+                "name": template_name,
+                "file": template_file.name,
+                "error": f"Failed to load: {str(e)}"
+            })
+
+    result = {
+        "count": len(templates),
+        "templates": templates
+    }
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.resource("templates://{template_name}")
+def get_template_content(template_name: str) -> str:
+    """Get the content of a specific AS3 template"""
+    try:
+        template = load_as3_template(template_name)
+
+        # Extract variables
+        template_str = json.dumps(template)
+        variables = re.findall(r'\{\{([A-Z_]+)\}\}', template_str)
+        unique_vars = list(set(variables))
+
+        result = {
+            "name": template_name,
+            "variables": unique_vars,
+            "template": template
+        }
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        return json.dumps({
+            "error": str(e)
+        }, indent=2)
 
 
 # ============================================================================
@@ -1021,6 +1795,83 @@ def help_prompt() -> str:
     - Authentication tokens are cached per-device for efficiency
     - Tokens automatically expire after 19 minutes
     - SSL verification can be enabled for production environments
+    """
+
+
+@mcp.prompt
+def create_app_workflow() -> str:
+    """Guide for creating AS3 applications with phpIPAM integration"""
+    return """
+    # AS3 Application Creation Workflow
+
+    This workflow demonstrates cross-MCP-server integration between phpIPAM and BIG-IP servers.
+
+    ## Prerequisites
+    - Both phpIPAM and BIG-IP MCP servers must be connected to Claude Desktop
+    - AS3 must be installed on the BIG-IP device
+    - phpIPAM must be configured with sections and subnets
+
+    ## Step-by-Step Process
+
+    ### 1. List Available Sections (phpIPAM)
+    Ask Claude: "List all sections from phpIPAM"
+    - This uses the phpIPAM server's `list_sections()` tool
+    - Returns: Section IDs, names, and descriptions
+
+    ### 2. Select Your Section
+    Choose the section for your application (e.g., "marketing", "engineering")
+
+    ### 3. Reserve Virtual IP (phpIPAM)
+    The workflow will:
+    - Find the appropriate subnet for virtual servers in your section
+    - Reserve the first available IP for your virtual server
+    - Tool: `reserve_ip_address(subnet_id, hostname)`
+
+    ### 4. Get Pool Member IPs (phpIPAM)
+    Ask Claude: "Show me web servers in the marketing section"
+    - Tool: `search_subnets(query="marketing web")`
+    - Tool: `get_subnet_details(subnet_id, include_addresses=true)`
+    - Select 2 or more IPs for your pool members
+
+    ### 5. Create Application (BIG-IP)
+    Ask Claude: "Create AS3 application for marketing using these IPs"
+    - Tool: `create_as3_app(device_name, section_name, virtual_ip, pool_members)`
+    - Claude will generate AS3 declaration from template
+    - Preview declaration before deployment
+    - Confirm deployment
+
+    ## Example Interaction
+
+    ```
+    User: "I want to create a load balancer for the marketing department"
+
+    Claude: [Calls phpIPAM list_sections()]
+           "Found these sections: marketing, engineering, finance"
+
+    User: "Use marketing"
+
+    Claude: [Reserves VIP] "Reserved 10.1.100.5 for virtual server"
+           [Lists web servers] "Found: 192.168.10.10, 192.168.10.11, 192.168.10.12"
+
+    User: "Use the first two"
+
+    Claude: [Shows preview] "Will create:
+             VIP: 10.1.100.5
+             Pool: 192.168.10.10, 192.168.10.11
+             Deploy to lab-bigip?"
+
+    User: "Yes"
+
+    Claude: [Deploys] "✅ Application created successfully!"
+    ```
+
+    ## MCP Features Demonstrated
+
+    - **Cross-Server Orchestration**: Claude coordinates between two MCP servers
+    - **Resources**: View available templates via `templates://available`
+    - **Prompts**: This workflow guide
+    - **Context State**: Cached authentication tokens
+    - **Human-in-the-Loop**: Preview before deployment
     """
 
 
