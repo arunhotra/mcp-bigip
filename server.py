@@ -54,6 +54,7 @@ class VirtualServer(BaseModel):
     name: str
     full_path: str
     destination: str
+    pool: Optional[str] = None
     enabled: bool
     availability_status: str
     description: Optional[str] = None
@@ -208,10 +209,15 @@ async def get_virtual_servers(
             virtual_servers = []
 
             for item in data.get("items", []):
+                # Extract pool name from pool reference (format: /Common/pool_name)
+                pool_ref = item.get("pool", "")
+                pool_name = pool_ref.split("/")[-1] if pool_ref else None
+
                 vs = VirtualServer(
                     name=item.get("name", ""),
                     full_path=item.get("fullPath", ""),
                     destination=item.get("destination", ""),
+                    pool=pool_name,
                     enabled=item.get("enabled", False),
                     availability_status=item.get("status", {}).get("availabilityState", "unknown"),
                     description=item.get("description")
@@ -311,22 +317,50 @@ async def list_virtual_servers(
         if ctx:
             await ctx.info(f"Found {len(virtual_servers)} virtual servers")
 
-        # Format the response
+        # Format the response as a table
         if not virtual_servers:
             return "No virtual servers found on this BIG-IP device."
 
-        output = [f"Found {len(virtual_servers)} virtual server(s) on BIG-IP {credentials.ip_address}:\n"]
+        # Helper function to parse destination into IP and Port
+        def parse_destination(dest: str):
+            """Parse destination format: /Common/10.1.1.100:80 or 10.1.1.100:80"""
+            if not dest:
+                return "N/A", "N/A"
+            # Remove partition prefix if present
+            dest_clean = dest.split("/")[-1]
+            # Split IP and port
+            if ":" in dest_clean:
+                ip, port = dest_clean.rsplit(":", 1)
+                return ip, port
+            return dest_clean, "N/A"
 
+        # Build table header
+        output = [
+            f"## Virtual Servers on {credentials.ip_address} ({len(virtual_servers)} total)\n",
+            "| Status | Name | Destination IP | Port | Pool |",
+            "|--------|------|----------------|------|------|"
+        ]
+
+        # Build table rows
         for vs in virtual_servers:
-            status_emoji = "✅" if vs.availability_status == "available" else "❌"
-            enabled_text = "enabled" if vs.enabled else "disabled"
+            # Status indicator
+            if vs.availability_status == "available":
+                status = "🟢"  # Green circle
+            elif vs.availability_status == "offline":
+                status = "🔴"  # Red circle
+            elif vs.availability_status == "unknown":
+                status = "⚪"  # White circle
+            else:
+                status = "🟡"  # Yellow circle for other states
 
-            output.append(f"\n{status_emoji} **{vs.name}**")
-            output.append(f"  - Full Path: {vs.full_path}")
-            output.append(f"  - Destination: {vs.destination}")
-            output.append(f"  - Status: {vs.availability_status} ({enabled_text})")
-            if vs.description:
-                output.append(f"  - Description: {vs.description}")
+            # Parse destination
+            dest_ip, dest_port = parse_destination(vs.destination)
+
+            # Pool name or "None"
+            pool_name = vs.pool if vs.pool else "None"
+
+            # Add row
+            output.append(f"| {status} | {vs.name} | {dest_ip} | {dest_port} | {pool_name} |")
 
         return "\n".join(output)
 
