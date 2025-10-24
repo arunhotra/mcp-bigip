@@ -1,0 +1,25 @@
+{
+  "devices": {
+    "prod-lb-01": {
+      "ip_address": "10.1.1.10",
+      "username": "admin",
+      "password": "your-password-here",
+      "verify_ssl": false,
+      "description": "Production load balancer 1"
+    },
+    "prod-lb-02": {
+      "ip_address": "10.1.1.11",
+      "username": "admin",
+      "password": "your-password-here",
+      "verify_ssl": false,
+      "description": "Production load balancer 2"
+    },
+    "lab-bigip": {
+      "ip_address": "192.168.1.100",
+      "username": "admin",
+      "password": "admin",
+      "verify_ssl": false,
+      "description": "Lab/test environment"
+    }
+  }
+}
